@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Model weights
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# Hugging Face cache
+hf-cache/
+.cache/
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.key
+
+# Generated images
+frame_*.png
+
+# Logs
+logs/
+
+
