@@ -1,7 +1,7 @@
 apriltag:
   ros__parameters:
     image_transport: raw
-    family: 36h11
+    family: 25h9
     size: 0.1524
     max_hamming: 0
     detector:
