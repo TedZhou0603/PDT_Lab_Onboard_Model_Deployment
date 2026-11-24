@@ -1,96 +1,143 @@
-import torch
-from PIL import Image, ImageOps
-from torchvision.transforms.functional import to_tensor
-from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
-from alpamayo1_5 import helper
-import time 
+import socket
+import struct
+import threading
+
 import cv2
 import numpy as np
-import socket
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image
+from std_msgs.msg import String
 
-number_of_images = 2
-#images = Image.open("./workspace/images/camera0.png").convert("RGB")
-start = time.perf_counter()
-image1 = Image.open("/workspace/images/camera0.png").convert("RGB")
-image2 = Image.open("/workspace/images/camera1.png").convert("RGB")
-image1 = ImageOps.fit(image1, (1920, 1080), method=Image.Resampling.LANCZOS) # Turn from 2064x1544 to 1920x1080
-image2 = ImageOps.fit(image2, (1920, 1080), method=Image.Resampling.LANCZOS)
+HOST = "127.0.0.1"
+IMAGE_PORT = 5001
+ANSWER_PORT = 5000
 
-#frames = to_tensor(image).unsqueeze(0)
-frames = torch.stack([
-    torch.from_numpy(np.array(image1)).permute(2, 0, 1),
-    torch.from_numpy(np.array(image2)).permute(2, 0, 1)
-])
-print("Frame shape: ", frames.shape)
-print("image 1 size: ", image1.size)
-print("image 2 size: ", image2.size)
-print("Original frames:")
-print("Min:", frames.min().item())
-print("Max:", frames.max().item())
-print("Mean:", frames.float().mean().item())
-for i, frame in enumerate(frames):
-    img = frame.permute(1, 2, 0).cpu().numpy()
-    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    cv2.imwrite(f"/workspace/Alpamayo1.5/frame_{i}.png", img)
 
-model = Alpamayo1_5.from_pretrained("nvidia/Alpamayo-1.5-10B", dtype=torch.bfloat16).to("cuda")
-processor = helper.get_processor(model.tokenizer)
-print(f"Startup time: {time.perf_counter() - start:.3f} seconds")
-ros_socket = socket.create_connection(("127.0.0.1", 5000))
-while True:
-    question = input("\n Ask the model a question or write x to exit")
+class AlpamayoBridge(Node):
+    def __init__(self):
+        super().__init__("alpamayo_bridge")
+        self.answer_pub = self.create_publisher(String, "/alpamayo/answer", 10)
+        self.declare_parameter("image_topic", "/image_raw")
+        image_topic = self.get_parameter("image_topic").value
+        self.image_sub = self.create_subscription(
+            Image, image_topic, self.image_callback, qos_profile_sensor_data
+        )
+        self.get_logger().info(f"Subscribing to camera topic: {image_topic}")
+        self.image_client = None
+        self.client_lock = threading.Lock()
+        threading.Thread(target=self.image_server, daemon=True).start()
+        threading.Thread(target=self.answer_server, daemon=True).start()
+        self.get_logger().info("Alpamayo bridge started")
 
-    if question.lower() == 'x':
-        break
+    def image_callback(self, msg):
+        self.get_logger().info(
+            f"Received image: {msg.width}x{msg.height}, encoding={msg.encoding}"
+        )
+        try:
+            raw = np.frombuffer(msg.data, dtype=np.uint8)
+            if msg.height <= 0 or msg.width <= 0 or msg.step <= 0:
+                return
+            if raw.size < msg.height * msg.step:
+                self.get_logger().warn("Incomplete camera image")
+                return
 
-    messages = helper.create_vqa_message(frames,question=question,num_frames_per_camera=number_of_images,)
+            rows = raw[:msg.height * msg.step].reshape(msg.height, msg.step)
+            if msg.encoding == "bayer_rggb8":
+                if msg.step < msg.width:
+                    return
+                bayer = rows[:, :msg.width]
+                image = cv2.cvtColor(bayer, cv2.COLOR_BayerRG2BGR)
+            elif msg.encoding in ("rgb8", "bgr8"):
+                row_bytes = msg.width * 3
+                if msg.step < row_bytes:
+                    return
+                image = rows[:, :row_bytes].reshape(msg.height, msg.width, 3)
+                if msg.encoding == "rgb8":
+                    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            else:
+                self.get_logger().warn(f"Unsupported image encoding: {msg.encoding}")
+                return
 
-    inputs = processor.apply_chat_template(messages,tokenize=True,add_generation_prompt=False,continue_final_message=True,return_dict=True,return_tensors="pt",)
-    
-    pixels = inputs["pixel_values"]
-
-    print("Processed pixels:")
-    print("Min:", pixels.min().item())
-    print("Max:", pixels.max().item())
-    print("Mean:", pixels.float().mean().item())
-    print("\nProcessor output:")
-    for key, value in inputs.items():
-        if isinstance(value, torch.Tensor):
-            print(
-                key,
-                "shape:", value.shape,
-                "min:", value.min().item(),
-                "max:", value.max().item()
+            success, encoded = cv2.imencode(
+                ".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 80]
             )
-        else:
-            print(key, type(value))
-    model_inputs = helper.to_device({"tokenized_data": inputs}, "cuda")
-    torch.cuda.synchronize()
-    # Generate answer
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.synchronize()
+            if not success:
+                self.get_logger().warn("JPEG encoding failed")
+                return
+            payload = encoded.tobytes()
+            packet = struct.pack("!I", len(payload)) + payload
+            with self.client_lock:
+                client = self.image_client
+                if client is not None:
+                    try:
+                        client.sendall(packet)
+                        self.get_logger().info(
+                            f"Sent JPEG frame: {len(payload)} bytes"
+                        )
+                    except OSError:
+                        try:
+                            client.close()
+                        except OSError:
+                            pass
+                        self.image_client = None
+                else:
+                    self.get_logger().warn("No Alpamayo image TCP client connected")
+        except Exception as e:
+            self.get_logger().error(f"Image error: {e}")
 
-    inference_start = time.perf_counter()
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        result = model.generate_text(data=model_inputs,top_p=0.98,temperature=0.6,num_samples=1,max_generation_length=256)
-    torch.cuda.synchronize()
-    inference_time = time.perf_counter() - inference_start
+    def image_server(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((HOST, IMAGE_PORT))
+            server.listen(1)
+            print("Image bridge listening on port 5001", flush=True)
+            while rclpy.ok():
+                client, _ = server.accept()
+                with self.client_lock:
+                    if self.image_client is not None:
+                        self.image_client.close()
+                    self.image_client = client
+                print("Alpamayo image client connected", flush=True)
 
-    print("\n--- Performance Metrics ---")
-    print(f"Inference latency: {inference_time:.3f} seconds")
-    print(f"Inference frequency: {1 / inference_time:.3f} Hz")
-    print(f"Images processed: {number_of_images}")
-    print(f"Image throughput: {number_of_images / inference_time:.3f} images/sec")
-    print(f"Peak GPU allocated memory: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GiB")
-    print(f"Peak GPU reserved memory: {torch.cuda.max_memory_reserved() / 1024**3:.2f} GiB")
-    print("\nQuestion:", question)
-    print("Alpamayo Answer:", result["answer"][0])
-    answer = str(result["answer"][0])
-    ros_socket.sendall((answer.replace("\n", " ") + "\n").encode("utf-8"))
-    #ros_socket.sendall(("Inference latency: " + str(inference_time) + "\n").encode("utf-8"))
-    #ros_socket.sendall(("Inference frequency: " + str(1 / inference_time) + "\n").encode("utf-8"))
-    #ros_socket.sendall(("Images Processed: " + str(number_of_images) + "\n").encode("utf-8"))
-    #ros_socket.sendall(("Image Throughput: " + str(number_of_images / inference_time:) + "\n").encode("utf-8"))
-    #ros_socket.sendall(("Images Processed: " + str(inference_time) + "\n").encode("utf-8"))
+    def answer_server(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((HOST, ANSWER_PORT))
+            server.listen(1)
+            print("Answer bridge listening on port 5000", flush=True)
+            while rclpy.ok():
+                client, _ = server.accept()
+                print("Alpamayo answer client connected", flush=True)
+                with client:
+                    buffer = b""
+                    while rclpy.ok():
+                        data = client.recv(4096)
+                        if not data:
+                            break
+                        buffer += data
+                        while b"\n" in buffer:
+                            line, buffer = buffer.split(b"\n", 1)
+                            answer = line.decode("utf-8", errors="replace").strip()
+                            if answer:
+                                msg = String()
+                                msg.data = answer
+                                self.answer_pub.publish(msg)
+                                print(f"Published answer: {answer}", flush=True)
 
-ros_socket.close()
+
+def main():
+    rclpy.init()
+    node = AlpamayoBridge()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
