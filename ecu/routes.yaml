@@ -1,0 +1,5 @@
+routes:
+  - {source: local, topic: /image_raw, type: sensor_msgs/msg/Image}
+  - {source: local, topic: /camera_info, type: sensor_msgs/msg/CameraInfo}
+  - {source: network, topic: /jetson/image_raw, type: sensor_msgs/msg/Image}
+  - {source: network, topic: /alpamayo/answer, type: std_msgs/msg/String}
